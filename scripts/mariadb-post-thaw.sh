@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: BSD-3-Clause
 # Copyright 2026 ARZ Haan AG
+# Author: Gerd Aschbrenner
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -32,40 +33,50 @@
 #
 # MariaDB Post-Thaw Script for MariaDB 11.5+ (InnoDB only)
 #
-# Use this script together with the mariadb-pre-freeze.sh script for external
-# volume-based backup tools like Veeam.
+# Use this script together with the mariadb-pre-freeze.sh script. Read the
+# documentation there first!
 #
 # Purpose:
-# - End the BACKUP STAGE and release locks after a Veeam snapshot.
+# - End the BACKUP STAGE and release locks right after a file system snapshot.
 # - Clean up the runtime directory created by the pre-freeze script.
 #
+# If the script is not called, or if it fails, the database write locks will
+# be released after the timeout configured in the pre-freeze script, if
+# they still exist.
+# As soon as this script is called, the backup is consistent:
+#  - if the pre-freeze script completed successfully
+#  - and the filesystem snapshot was taken successfully
+#
 # Usage:
-# - Optionally override SCRIPT_TIMEOUT_SEC (the script can run slightly longer).
+# - Optionally override POST_THAW_FLOW_TIMEOUT_SEC (the script can run
+#   slightly longer).
 # - Optionally override DEBUG_LOGS_ENABLED=true for verbose logging.
 #
 # Requirements:
-# - A running mariadb client session started by the pre-freeze script.
+# - A running MariaDB client session started by the pre-freeze script.
 # - The runtime directory with FIFO files and state file must exist.
 # - systemd-cat is optional; without it logs go to stdout/stderr only.
 #
 # Notes:
-# - If FREEZE_AND_THAW_TIMEOUT_SEC (from pre-freeze) has expired, the mariadb
+# - If FREEZE_AND_THAW_TIMEOUT_SEC from pre-freeze has expired, the MariaDB
 #   client may already be terminated. In this case, BACKUP STAGE END will fail,
 #   but the script will still clean up the runtime directory.
 #
 # Flow and Process Safety:
 # - This script is called AFTER the snapshot is taken
-# - It communicates with the persistent mariadb session started by pre-freeze
+# - It communicates with the persistent MariaDB client session started by
+#   pre-freeze.
 # - It must release all BACKUP STAGE locks before returning
-# - If the persistent session is dead (timeout), it still cleans up the runtime dir
+# - If the persistent session is dead (timeout), it still cleans up the runtime
+#   dir
 # - Exit code 0 = success (BACKUP STAGE END completed)
 # - Exit code 1 = warnings/errors (e.g., client already dead, but cleanup OK)
 #
 # Return Codes:
 #   0 = Everything OK, BACKUP STAGE END sent successfully
 #   1 = Errors detected (state file mismatch, client dead, FIFOs missing, etc.)
-#       In this case, runtime dir is still cleaned up, but backup consistency is unclear.
-#       Administrator should verify database state: SHOW VARIABLES LIKE 'innodb_backup_stage';
+#       In this case, runtime dir is still cleaned up, but backup consistency
+#       is unclear.
 #
 # Required State File Content:
 # - pre-freeze must have written "BLOCK_COMMIT" to the state file
@@ -74,68 +85,48 @@
 #
 # Process Cleanup Order (Important):
 # 1. Send BACKUP STAGE END (if client still alive)
-# 2. Kill mariadb client (releases backup stage locks)
-# 3. Kill FIFO holder (closes FIFOs, allows mariadb to fully exit)
-# 4. Remove lock file (signals any remaining processes)
-# 5. Remove entire runtime directory
+# 2. Kill MariaDB client (releases backup stage locks)
+# 3. Remove entire runtime directory
+#    - This also removes any FIFO/lock artifacts (signals any remaining background processes)
 #
 # Troubleshooting:
+#
+# Check logs: journalctl -t mariadb-stage-backup
 #
 # 1. "RUN_DIR does not exist":
 #    - pre-freeze never ran or crashed before creating run dir
 #    - Check if database is actually locked: SHOW PROCESSLIST;
-#    - Manually check BACKUP STAGE state: SHOW VARIABLES LIKE 'innodb_backup_stage';
-#    - Manually release if stuck: BACKUP STAGE END;
-#    - You may need to investigate why pre-freeze failed
+#      Search for "backup stage" commands and kill them, if no backup job is
+#      running.
 #
 # 2. "Unexpected state: START/FLUSH/BLOCK_DDL":
-#    - pre-freeze crashed after starting stages but before reaching BLOCK_COMMIT
-#    - Return code will be 1, but cleanup still proceeds
-#    - This is a sign of serious problems; investigate pre-freeze logs
-#    - Database may be in inconsistent state; verify backup integrity after restore
+#    - pre-freeze crashed after starting stages but before reaching
+#      BLOCK_COMMIT
+#    - Return code will be 1, but cleanup still proceeds. This should not
+#      cause locks to remain, but backup consistency is not guaranteed.
+#    - Usually, backup tools treat script failures as failed backups; verify
+#      this behavior in your backup tool.
 #
-# 3. "mariadb client already stopped (may have timed out)":
-#    - Snapshot took > FREEZE_AND_THAW_TIMEOUT_SEC
-#    - Mariadb was force-killed by the timeout wrapper
+# 3. "MariaDB client already stopped (may have timed out, or network issue)":
+#    - Snapshot took longer than FREEZE_AND_THAW_TIMEOUT_SEC configured in the
+#      pre-freeze script.
+#    - MariaDB client was force-killed by the timeout wrapper
 #    - BACKUP STAGE locks may still be held (check with SHOW PROCESSLIST)
 #    - Cleanup still proceeds; runtime dir removed
-#    - Administrator should verify database state manually
 #    - Next backup attempt can proceed (pre-freeze will clean stale lock)
 #
-# 4. "BACKUP STAGE END failed":
-#    - mariadb connection lost or broken
-#    - SQL command did not return the expected marker
-#    - Return code will be 1
-#    - Cleanup still proceeds, but database may remain locked
-#    - Check logs: journalctl -t mariadb-stage-backup
-#
-# 5. "Timeout waiting for SQL response":
-#    - post-thaw itself timed out (SCRIPT_TIMEOUT_SEC exceeded)
-#    - FIFOs may be broken or mariadb hung
-#    - Increase timeout: env SCRIPT_TIMEOUT_SEC=300 ./mariadb-post-thaw.sh
-#    - Or force kill: kill -9 <mariadb_pid>, rm -rf ~/.mariadb-stage-backup-run-dir
-#
-# 6. "mariadb pid validation failed (likely PID reuse)":
+# 4. "MariaDB client PID validation failed (likely PID reuse)":
 #    - The PID file contains a dead or wrong process
 #    - Script will skip killing (safety measure)
 #    - Runtime dir is still cleaned up
-#    - Check for zombie mariadb processes: ps aux | grep -i mariadb
-#
-# Best Practices:
-# - Always check logs after every backup: journalctl -t mariadb-stage-backup -n 50
-# - Monitor FREEZE_AND_THAW_TIMEOUT_SEC; set it > expected snapshot time + 5 min
-# - Test the full backup pipeline regularly (pre-freeze + snapshot + post-thaw)
-# - Document your snapshot tool's expected duration and behavior
-# - Verify restore procedure (point-in-time recovery) in a test environment
-# - Keep detailed backups logs and correlate them with database logs
-# - Alert on non-zero exit codes from either script
+#    - Check for zombie MariaDB client processes: ps aux | grep -i mariadb
 #
 
 set -euo pipefail
 readonly DEBUG_LOGS_ENABLED="${DEBUG_LOGS_ENABLED:-false}"
-readonly SCRIPT_TIMEOUT_SEC="${SCRIPT_TIMEOUT_SEC:-180}"  # 3 minutes default
+readonly POST_THAW_FLOW_TIMEOUT_SEC="${POST_THAW_FLOW_TIMEOUT_SEC:-180}"  # 3 minutes default
 
-# Safety check: HOME must be set and absolute
+# Safety check: HOME must be set and absolute.
 if [[ -z "${HOME:-}" ]] || [[ ! "${HOME}" =~ ^/ ]]; then
     echo "[ERROR] HOME is not set or not absolute. Cannot proceed." >&2
     exit 1
@@ -144,7 +135,7 @@ fi
 readonly LOG_PREFIX="[post-thaw]"
 readonly SQL_MARKER="---MARKER---"
 
-# same as in mariadb-pre-freeze.sh!
+# Same as in mariadb-pre-freeze.sh!
 readonly LOG_TAG="mariadb-stage-backup"
 readonly RUN_DIR="${HOME}/.mariadb-stage-backup-run-dir"
 readonly MARIADB_PID_FILE="${RUN_DIR}/mariadb.pid"
@@ -152,7 +143,7 @@ readonly FIFO_IN="${RUN_DIR}/mariadb.in.fifo"
 readonly FIFO_OUT="${RUN_DIR}/mariadb.out.fifo"
 readonly STATE_FILE="${RUN_DIR}/mariadb-stage-backup.state"
 
-# remember start time of this script.
+# Remember the start time of this script.
 SCRIPT_START_EPOCH="$(date +%s)"
 readonly SCRIPT_START_EPOCH
 
@@ -168,7 +159,7 @@ function log() {
     local prio="${1:-6}"   # default: info (6)
     shift || true
 
-    # best effort failsafe for wrong prio level
+    # best-effort fallback for wrong prio level
     if [[ ! "$prio" =~ ^[0-7]$ ]]; then
         prio=6
     fi
@@ -196,13 +187,13 @@ function log_info() { log 6 "[INFO] $*"; }
 function log_warn() { log 4 "[WARN] $*"; }
 function log_error() { log 3 "[ERROR] $*"; }
 
-# helper function: remaining time in seconds until script timeout
+# helper function: remaining time in seconds until POST_THAW_FLOW_TIMEOUT_SEC timeout
 # A minimum of 1 sec will be returned so that timed reads do not exit immediately.
 function remaining_seconds() {
     local now elapsed remaining
     now="$(date +%s)"
     elapsed=$(( now - SCRIPT_START_EPOCH ))
-    remaining=$(( SCRIPT_TIMEOUT_SEC - elapsed ))
+    remaining=$(( POST_THAW_FLOW_TIMEOUT_SEC - elapsed ))
 
     # Minimum 1 second so reads do not time out immediately.
     if (( remaining < 1 )); then
@@ -214,7 +205,7 @@ function remaining_seconds() {
 function timeout_reached() {
     local now
     now="$(date +%s)"
-    (( now - SCRIPT_START_EPOCH >= SCRIPT_TIMEOUT_SEC ))
+    (( now - SCRIPT_START_EPOCH >= POST_THAW_FLOW_TIMEOUT_SEC ))
 }
 
 # helper function: validate PID against reuse
@@ -247,7 +238,7 @@ function validate_pid() {
     # Check cmdline matches (protect against PID reuse)
     if [[ -n "${expected_cmdline_pattern}" ]]; then
         local current_cmdline
-        current_cmdline="$(cat /proc/"${pid}"/cmdline 2>/dev/null | tr '\0' ' ' || true)"
+        current_cmdline="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null || true)"
         if [[ ! "${current_cmdline}" =~ ${expected_cmdline_pattern} ]]; then
             log_warn "PID ${pid} cmdline mismatch. Expected pattern: ${expected_cmdline_pattern}, got: ${current_cmdline}"
             return 1
@@ -278,14 +269,14 @@ function get_pid_from_file() {
     echo "${pid_info}" | cut -d: -f1
 }
 
-# helper function: stop and kill a process by pid file with PID reuse protection
+# helper function: stop and kill a process by PID file with PID reuse protection
 function stop_and_kill_by_pid_file() {
     local pid_file="$1"
     local label="${2:-process}"
     local expected_cmdline_pattern="${3:-}"  # optional cmdline pattern for validation
 
     if [[ ! -f "${pid_file}" ]]; then
-        log_debug "Pid file not found (${pid_file}). Cannot stop or kill ${label}."
+        log_debug "PID file not found (${pid_file}). Cannot stop or kill ${label}."
         return 0
     fi
 
@@ -320,11 +311,11 @@ function stop_and_kill_by_pid_file() {
 # --- check directory ---
 # Without data from the run directory this script cannot work.
 if [[ ! -d "${RUN_DIR}" ]]; then
-    log_error "RUN_DIR (${RUN_DIR}) does not exist. The database may be locked! The mariadb process may still be running. The backup may be inconsistent."
+    log_error "RUN_DIR (${RUN_DIR}) does not exist. The database may be locked! The MariaDB client process may still be running. The backup may be inconsistent."
     exit 1
 fi
 
-# Trying to free the locks in a clean way, with a best effort failover.
+# Trying to free the locks in a clean way, with a best effort fallback.
 # If the clean way does not work, the return code will not be 0.
 return_code=0
 
@@ -335,25 +326,25 @@ if [[ "${current_state}" != "BLOCK_COMMIT" ]]; then
     log_warn "Unexpected state: ${current_state}. Backup may be inconsistent."
     return_code=1
 else
-    log_debug "state file check passed with: ${current_state}"
+    log_debug "State file check passed with: ${current_state}"
 fi
 
-# --- Load mariadb pid (actually the timeout wrapper PID from pre-freeze) ---
+# --- Load MariaDB client PID (actually the timeout wrapper PID from pre-freeze) ---
 MARIADB_PID=""
 if [[ -f "${MARIADB_PID_FILE}" ]]; then
     MARIADB_PID="$(get_pid_from_file "${MARIADB_PID_FILE}" || true)"
     if [[ -z "${MARIADB_PID}" ]]; then
-        log_error "No mariadb pid found in ${MARIADB_PID_FILE}."
+        log_error "No MariaDB client PID found in ${MARIADB_PID_FILE}."
         return_code=1
     elif ! validate_pid "${MARIADB_PID_FILE}" "timeout.*mariadb"; then
-        log_error "mariadb pid validation failed (likely PID reuse) in ${MARIADB_PID_FILE}."
+        log_error "MariaDB client PID validation failed (likely PID reuse) in ${MARIADB_PID_FILE}."
         return_code=1
         MARIADB_PID=""  # Reset to avoid killing wrong process
     else
-        log_debug "Loaded and validated mariadb pid (timeout wrapper): ${MARIADB_PID}"
+        log_debug "Loaded and validated MariaDB client PID (timeout wrapper): ${MARIADB_PID}"
     fi
 else
-    log_error "Missing mariadb pid file: ${MARIADB_PID_FILE}."
+    log_error "Missing MariaDB client PID file: ${MARIADB_PID_FILE}."
     return_code=1
 fi
 readonly MARIADB_PID
@@ -361,7 +352,7 @@ readonly MARIADB_PID
 if [[ -n "${MARIADB_PID}" ]] && kill -0 "${MARIADB_PID}" 2>/dev/null; then
     # --- send SQL "BACKUP STAGE END" if FIFOs exist ---
     if [[ -p "${FIFO_IN}" && -p "${FIFO_OUT}" ]]; then
-        # --- Create persistent file descriptors for this script ---
+        # --- Create persistent file descriptors for this script. ---
         # FD 3 = Writing to FIFO_IN (additionally to the holder)
         # FD 4 = Reading from FIFO_OUT (additionally to the holder)
         exec 3> "${FIFO_IN}"
@@ -372,21 +363,21 @@ if [[ -n "${MARIADB_PID}" ]] && kill -0 "${MARIADB_PID}" 2>/dev/null; then
             local sql="$1"
 
             if ! kill -0 "${MARIADB_PID}" 2>/dev/null; then
-                log_error "mariadb client is not running anymore (${MARIADB_PID})."
+                log_error "MariaDB client is not running anymore (${MARIADB_PID})."
                 return 1
             fi
 
             # Validate PID hasn't been reused before sending SQL
             if ! validate_pid "${MARIADB_PID_FILE}" "timeout.*mariadb"; then
-                log_error "mariadb client PID validation failed (likely PID reuse)."
+                log_error "MariaDB client PID validation failed (likely PID reuse)."
                 return 1
             fi
 
-            # send SQL + Marker via FD 3
+            # Send SQL and Marker via FD 3
             log_debug "mariadb> ${sql}\\nSELECT \"${SQL_MARKER}\" AS marker;\\n"
             printf '%s\nSELECT "%s" AS marker;\n' "${sql}" "${SQL_MARKER}" >&3
 
-            # read response until marker appears (or timeout)
+            # Read response until marker appears (or timeout)
             local line
             local response=""
             local found_marker=0
@@ -408,7 +399,7 @@ if [[ -n "${MARIADB_PID}" ]] && kill -0 "${MARIADB_PID}" 2>/dev/null; then
 
                 log_debug "mariadb> ${line}"
 
-                # Check for SQL errors (ERROR keyword from MariaDB)
+                # Check for SQL errors (ERROR keyword from MariaDB client output)
                 if [[ "$line" =~ ^ERROR ]]; then
                     log_debug "SQL Error in response: ${line}"
                     has_error=1
@@ -458,12 +449,12 @@ if [[ -n "${MARIADB_PID}" ]] && kill -0 "${MARIADB_PID}" 2>/dev/null; then
         return_code=1
     fi
 
-    # --- Stop mariadb process (via timeout wrapper), that will also free the "backup stage" locks. ---
-    # Killing the timeout wrapper will propagate the signal to the mariadb client.
+    # --- Stop MariaDB client process (via timeout wrapper), that will also free the "backup stage" locks. ---
+    # Killing the timeout wrapper will propagate the signal to the MariaDB client.
     if kill -0 "${MARIADB_PID}" 2>/dev/null; then
         stop_and_kill_by_pid_file "${MARIADB_PID_FILE}" "mariadb_client_via_timeout_wrapper" "timeout.*mariadb"
     else
-        log_info "mariadb client already stopped (may have timed out after ${FREEZE_AND_THAW_TIMEOUT_SEC}s)."
+        log_info "MariaDB client already stopped (may have timed out)."
         rm -f "${MARIADB_PID_FILE}"
     fi
 fi

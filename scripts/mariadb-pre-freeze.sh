@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: BSD-3-Clause
 # Copyright 2026 ARZ Haan AG
+# Author: Gerd Aschbrenner
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -33,7 +34,39 @@
 # MariaDB Pre-Freeze Script for MariaDB 11.5+ (InnoDB only)
 #
 # Use this script together with the mariadb-post-thaw.sh script for external
-# volume-based backup tools like Veeam.
+# filesystem-based backup tools like Veeam, Commvault, etc. that do not have
+# native MariaDB integration. These scripts use the MariaDB BACKUP STAGE
+# feature instead of FTWRL (FLUSH TABLES WITH READ LOCK). This allows for
+# minimal downtime and better performance during the backup window, as
+# applications can still read from the database with only a short write
+# lock during the BACKUP STAGE commands.
+#
+# This backup strategy can only work if your applications do not execute
+# long-running transactions or DDL during or shortly before the backup window,
+# as those will block the "backup stage" commands too long and the scripts
+# will fail with a timeout. If you have such workloads, consider using a
+# different backup approach (e.g. mariadb-backup or logical dumps).
+# Taking the filesystem snapshot should also be fast enough to complete
+# within the timeout, ideally in seconds rather than minutes. A simple cp or
+# scp would be too slow for large datasets; use a proper snapshot tool or
+# filesystem that can complete within the timeout.
+#
+# The benefits of this backup strategy are:
+# - Minimal downtime: only short write locks during BACKUP STAGE commands and
+#   the filesystem snapshot operations.
+# - Tools like Veeam or Commvault can restore a VM snapshot directly without
+#   needing to restore a logical dump or mariadb-backup files.
+# - No extra disk space or I/O needed for a backup copy (unlike mariadb-backup
+#   or logical dumps).
+#
+# The downsides and risks of this backup strategy are:
+# - Backups may fail due to timeouts (long-running transactions or DDL during
+#   the backup window, or long-running filesystem snapshots)
+# - The write locks during BACKUP STAGE commands and filesystem snapshots can
+#   cause SQL timeouts in applications.
+#   If BACKUP STAGE commands and filesystem snapshots only need a few seconds,
+#   then an application might hang a short time, but if it takes minutes,
+#   then applications might start to fail with SQL timeouts.
 #
 # Purpose:
 # - Initiate MariaDB BACKUP STAGE steps to get a consistent filesystem snapshot
@@ -43,31 +76,48 @@
 # - A timeout of 10 minutes (can be overridden) is enforced; if the snapshot
 #   is not taken in time, the database files may be inconsistent, and this
 #   script will fail.
+# - Backup tools should fail if the scripts fail, so that you do not end up
+#   with inconsistent snapshots.
+# - Backup tools should execute the post-thaw script after the snapshot is
+#   taken to release the locks and clean up.
 #
 # References:
 # - https://mariadb.com/docs/server/reference/sql-statements/administrative-sql-statements/backup-commands/backup-stage
-# - https://helpcenter.veeam.com/docs/vbr/userguide/pre_post_scripts.html
+# - Veeam:
+#   - https://helpcenter.veeam.com/docs/vbr/userguide/pre_post_scripts.html
+#   - https://helpcenter.veeam.com/docs/vbr/userguide/backup_job_vss_scripts_vm.html
+# - Commvault: https://documentation.commvault.com/v11/commcell-console/pre_freeze_and_post_thaw_processing_using_vmware_tools.html
 #
 # Usage:
-# - Optionally override FREEZE_AND_THAW_TIMEOUT_SEC (the mariadb client + FIFO holder can run longer across freeze/thaw).
-# - Optionally override SCRIPT_TIMEOUT_SEC (the script can run slightly longer).
+# - Optionally override FREEZE_AND_THAW_TIMEOUT_SEC (the MariaDB client + FIFO
+#   holder can run longer across freeze/thaw).
+# - Optionally override PRE_FREEZE_FLOW_TIMEOUT_SEC (the script can run
+#   slightly longer).
 # - Optionally set DEBUG_LOGS_ENABLED=true for verbose logging.
 #
 # Timeout implementation:
-# - SCRIPT_TIMEOUT_SEC limits this script's own runtime (reads, SQL responses, overall flow).
-# - FREEZE_AND_THAW_TIMEOUT_SEC limits how long the mariadb client + FIFO holder stay alive
-#   across pre-freeze, snapshot, and post-thaw.
-# - The mariadb client is run under timeout; the FIFO holder also enforces the same limit.
-# - When the limit is hit, the client is terminated and the run dir may be left behind.
+# - PRE_FREEZE_FLOW_TIMEOUT_SEC limits this script's own runtime (reads, SQL
+#   responses, overall flow). It is not an overall hard limit, but it covers
+#   all operations that are locking the database.
+# - FREEZE_AND_THAW_TIMEOUT_SEC limits how long the MariaDB client + FIFO
+#   holder stay alive across pre-freeze, snapshot, and post-thaw.
+# - The MariaDB client is run under timeout; the FIFO holder also enforces
+#   the same limit.
+# - When the limit is hit, the client is terminated and the run dir may be
+#   left behind.
 #
 # Requirements:
-# - mariadb, mkfifo, stdbuf, and timeout must be installed and in PATH.
+# - mariadb (client), mkfifo, stdbuf, and timeout must be installed and in PATH.
+#   This script checks for them.
 # - systemd-cat is optional; without it logs go to stdout/stderr only.
 # - See setup section for required files and config.
 #
-# Setup:
+# Setup (with "veeam" as an example backup user):
 # - Create a Linux user "veeam" and add its public SSH key to authorized_keys.
-# - Copy this script and mariadb-post-thaw.sh into the user's home and make them executable:
+#   - Use the private SSH key for running the scripts via Veeam or other tools
+#     over an SSH connection.
+# - Copy this script and mariadb-post-thaw.sh into the user's home and make
+#   them executable:
 #   chmod 700 /home/veeam/mariadb-*.sh
 #
 # Create a DB user:
@@ -83,28 +133,53 @@
 # Test the script and check logs with:
 #   journalctl -t mariadb-stage-backup
 #
+# If you do not want to create a dedicated user, or need multiple credentials
+# in the .my.cnf file, then use the defaults-group-suffix option of the
+# mariadb client. For example add this to the .my.cnf:
+#   [client-veeam]
+#   user=veeam
+#   password=secure-password
+#
+# Then you can specify the group suffix via the MYSQL_GROUP_SUFFIX environment
+# variable when calling the script, and it will use the credentials from that
+# group. For example:
+#   env MYSQL_GROUP_SUFFIX=-veeam ./mariadb-pre-freeze.sh
+#
 # Timeout Behavior and Parameters:
-# - SCRIPT_TIMEOUT_SEC (default 600s / 10 min): limits this script's runtime.
-#   Includes all preflight checks, SQL commands, and syncs. Mainly for safety.
-# - FREEZE_AND_THAW_TIMEOUT_SEC (default 1200s / 20 min): limits the lifetime of the
-#   persistent mariadb session and FIFO holder across pre-freeze, snapshot, and post-thaw.
-#   This is the critical timeout for snapshot tools. If snapshot takes > 20 min, the
-#   database will be forcibly unlocked (BACKUP STAGE END will fail).
-#   Recommendation: snapshot should complete in 10-15 minutes; set this to 2x expected time.
+# - PRE_FREEZE_FLOW_TIMEOUT_SEC (default 600s / 10 min): limits this script's
+#   runtime.
+#   Includes all preflight checks, SQL commands, and syncs until the
+#   filesystem snapshot can be taken.
+# - FREEZE_AND_THAW_TIMEOUT_SEC (default 1200s / 20 min): limits the lifetime
+#   of the persistent MariaDB client session and FIFO holder across pre-freeze,
+#   filesystem snapshot, and post-thaw.
+#   If the "backup stage" commands or the filesystem snapshot takes too long,
+#   the database will be forcibly unlocked. Applications will be able to
+#   access the database again, but the filesystem snapshot can be inconsistent
+#   and should be discarded. Backup tools should detect the script failure
+#   and fail the backup job, so that you do not end up with inconsistent
+#   snapshots.
+# - FREEZE_AND_THAW_TIMEOUT_SEC should be PRE_FREEZE_FLOW_TIMEOUT_SEC + filesystem
+#   snapshot time + post-thaw script time + some buffer.
 #
 # How It Works (Advanced):
 # 1. pre-freeze:
 #    a. Creates runtime directory with FIFOs and lock file
-#    b. Starts a persistent mariadb session under timeout wrapper (as background process)
+#    b. Starts a persistent MariaDB client session under timeout wrapper
+#       (as background process)
 #    c. Starts FIFO holder process (keeps FIFOs open, survives pre-freeze)
 #    d. Executes BACKUP STAGE START/FLUSH/BLOCK_DDL/BLOCK_COMMIT via FIFO
 #    e. Closes its own FDs (but FIFOs stay open via FIFO holder)
-#    f. Returns with database in consistent state, ready for snapshot
-# 2. Snapshot tool takes filesystem snapshot (should complete in minutes)
+#    f. Calls sync to flush filesystem caches; this is the point where the
+#       database and filesystem are in a consistent state and the snapshot
+#       should be taken immediately after this command completes.
+#    g. Returns with database in consistent state, ready for filesystem
+#       snapshot
+# 2. Snapshot tool takes filesystem snapshot (should complete in seconds)
 # 3. post-thaw:
 #    a. Reads state file to verify database state
-#    b. Executes BACKUP STAGE END via the still-running mariadb session
-#    c. Kills mariadb session and FIFO holder
+#    b. Executes BACKUP STAGE END via the still-running MariaDB client session
+#    c. Kills MariaDB client session and FIFO holder
 #    d. Removes runtime directory
 #
 # FIFO Communication Protocol:
@@ -117,39 +192,46 @@
 # Troubleshooting:
 #
 # 1. Script hangs or times out:
-#    - Check DATABASE connectivity: mariadb
+#    - Check database connectivity: mariadb
 #    - Check DB logs: tail -f /var/log/mariadb/mariadb.log
 #    - Look for BACKUP STAGE errors in journalctl
 #    - Example: journalctl -t mariadb-stage-backup -n 100 | grep -i error
 #
-# 2. "Cannot connect to mariadb":
+# 2. "Cannot connect to MariaDB":
 #    - Verify ~/.my.cnf exists and is readable (chmod 600)
 #    - Test credentials: mariadb -e "SELECT 1;"
 #    - Ensure veeam user has RELOAD + PROCESS grants
 #    - Check MariaDB socket/port in my.cnf [client] section
 #
 # 3. "Another backup process is running":
-#    - Check if old pre-freeze is still running: ps aux | grep mariadb-pre-freeze
+#    - Check if old pre-freeze is still running:
+#      ps aux | grep mariadb-pre-freeze
 #    - If yes, wait or kill it: kill -9 <pid>
-#    - If snapshot tool crashed: manually run post-thaw to clean up (or wait until timeout)
+#    - If snapshot tool crashed: manually run post-thaw to clean up (or wait
+#      until timeout)
 #    - Check lock file: ls -la ~/.mariadb-stage-backup-run-dir/
 #
-# 4. "Timeout waiting for SQL response" or "Timeout after 20 min":
+# 4. "Timeout waiting for SQL response" or "Timeout after 10 min":
 #    - Snapshot took too long or was never taken
 #    - Check if snapshot tool has errors
-#    - Increase FREEZE_AND_THAW_TIMEOUT_SEC: env FREEZE_AND_THAW_TIMEOUT_SEC=2400 ./mariadb-pre-freeze.sh
+#    - Increase FREEZE_AND_THAW_TIMEOUT_SEC:
+#      env FREEZE_AND_THAW_TIMEOUT_SEC=2400 ./mariadb-pre-freeze.sh
 #    - Run post-thaw to release locks: ./mariadb-post-thaw.sh
-#    - Database may have stale BACKUP STAGE state; check with: SHOW PROCESSLIST;
+#    - Database may have stale BACKUP STAGE state; check with:
+#      mariadb -e "SHOW PROCESSLIST";
 #
 # 5. "Stale lock found, cleaning runtime dir":
 #    - Indicates a crashed pre-freeze from a previous run
 #    - Script auto-cleans and proceeds (safe)
-#    - Check logs for why it crashed: journalctl -t mariadb-stage-backup --since "2 hours ago"
+#    - Check logs for why it crashed:
+#      journalctl -t mariadb-stage-backup --since "2 hours ago"
 #
 # 6. Database locked, snapshot failed, unclear state:
-#    - Check current BACKUP STAGE state: SHOW VARIABLES LIKE 'innodb_backup_stage';
-#    - Manually release if needed: BACKUP STAGE END;
-#    - Check post-thaw cleanup worked: ls -la ~/.mariadb-stage-backup-run-dir/ (should be empty)
+#    - Find sql connection with "backup stage" in the command:
+#      mariadb -e "SHOW PROCESSLIST;" | grep -i "backup stage"
+#    - Kill the connection too free the locks: kill <PID>
+#    - Check logs for details and errors
+#
 #
 # Safety and Consistency:
 # - The scripts use PID validation (cmdline + start_time) to prevent killing wrong processes
@@ -160,13 +242,20 @@
 #   journalctl -t mariadb-stage-backup
 #   SHOW PROCESSLIST;
 #
+# Best Practices:
+# - Have a restore strategy. Test restores regularly (ideally automated) to
+#   ensure your backups are valid and that you know the restore process.
+# - Set up alerting for failed or missing backups. Test it from time to time.
+# - Keep FREEZE_AND_THAW_TIMEOUT_SEC small, but add extra time for high-load
+#   scenarios.
+#
 
 set -euo pipefail
 readonly DEBUG_LOGS_ENABLED="${DEBUG_LOGS_ENABLED:-false}"
-readonly SCRIPT_TIMEOUT_SEC="${SCRIPT_TIMEOUT_SEC:-600}"  # 10 minutes default
+readonly PRE_FREEZE_FLOW_TIMEOUT_SEC="${PRE_FREEZE_FLOW_TIMEOUT_SEC:-600}"  # 10 minutes default
 readonly FREEZE_AND_THAW_TIMEOUT_SEC="${FREEZE_AND_THAW_TIMEOUT_SEC:-1200}"  # 20 minutes default
 
-# Safety check: HOME must be set and absolute
+# Safety check: HOME must be set and absolute.
 if [[ -z "${HOME:-}" ]] || [[ ! "${HOME}" =~ ^/ ]]; then
     echo "[ERROR] HOME is not set or not absolute. Cannot proceed." >&2
     exit 1
@@ -176,7 +265,7 @@ readonly LOG_PREFIX="[pre-freeze]"
 readonly SQL_MARKER="---MARKER---"
 readonly DEFAULTS_FILE="${HOME}/.my.cnf"
 
-# same as in mariadb-post-thaw.sh!
+# Same as in mariadb-post-thaw.sh!
 readonly LOG_TAG="mariadb-stage-backup"
 readonly RUN_DIR="${HOME}/.mariadb-stage-backup-run-dir"
 readonly MARIADB_PID_FILE="${RUN_DIR}/mariadb.pid"
@@ -187,7 +276,7 @@ readonly STATE_FILE="${RUN_DIR}/mariadb-stage-backup.state"
 readonly LOCK_FILE="${RUN_DIR}/mariadb-stage-backup.lock"
 readonly FIFO_HOLDER_PID_FILE="${RUN_DIR}/fifo_holder.pid"
 
-# remember start time of this script.
+# Remember the start time of this script.
 SCRIPT_START_EPOCH="$(date +%s)"
 readonly SCRIPT_START_EPOCH
 
@@ -205,7 +294,7 @@ function log() {
     local prio="${1:-6}"   # default: info (6)
     shift || true
 
-    # best effort failsafe for wrong prio level
+    # best-effort fallback for wrong prio level
     if [[ ! "$prio" =~ ^[0-7]$ ]]; then
         prio=6
     fi
@@ -239,7 +328,7 @@ function log_system_cat_only() {
     local prio="${1:-6}"   # default: info (6)
     shift || true
 
-    # best effort failsafe for wrong prio level
+    # best-effort fallback for wrong prio level
     if [[ ! "$prio" =~ ^[0-7]$ ]]; then
         prio=6
     fi
@@ -252,13 +341,13 @@ function log_system_cat_only() {
     fi
 }
 
-# helper function: remaining time in seconds until script timeout
+# helper function: remaining time in seconds until PRE_FREEZE_FLOW_TIMEOUT_SEC timeout
 # A minimum of 1 sec will be returned, so that timed reads are still possible.
 function remaining_seconds() {
     local now elapsed remaining
     now="$(date +%s)"
     elapsed=$(( now - SCRIPT_START_EPOCH ))
-    remaining=$(( SCRIPT_TIMEOUT_SEC - elapsed ))
+    remaining=$(( PRE_FREEZE_FLOW_TIMEOUT_SEC - elapsed ))
 
     # Minimum 1 second so reads do not time out immediately.
     if (( remaining < 1 )); then
@@ -270,16 +359,16 @@ function remaining_seconds() {
 function timeout_reached() {
     local now
     now="$(date +%s)"
-    (( now - SCRIPT_START_EPOCH >= SCRIPT_TIMEOUT_SEC ))
+    (( now - SCRIPT_START_EPOCH >= PRE_FREEZE_FLOW_TIMEOUT_SEC ))
 }
 
 # --- Preflight checks ---
 if [[ ! -f "${DEFAULTS_FILE}" ]]; then
-    log_error "mariadb defaults file not found: ${DEFAULTS_FILE}"
+    log_error "MariaDB defaults file not found: ${DEFAULTS_FILE}"
     exit 1
 fi
 if ! command -v mariadb &>/dev/null; then
-    log_error "mariadb client not found in PATH."
+    log_error "MariaDB client 'mariadb' not found in PATH."
     exit 1
 fi
 if ! command -v mkfifo &>/dev/null; then
@@ -295,13 +384,13 @@ if ! command -v timeout &>/dev/null; then
     exit 1
 fi
 
-# --- Test mariadb connectivity ---
+# --- Test MariaDB connectivity ---
 if ! mariadb --defaults-file="${DEFAULTS_FILE}" -e "SELECT 1;" &>/dev/null; then
-    log_error "Cannot connect to mariadb – check credentials in ${DEFAULTS_FILE}"
+    log_error "Cannot connect to MariaDB - check credentials in ${DEFAULTS_FILE}"
     exit 1
 fi
 
-# --- No usage of unsupported database engines? ---
+# --- Check for unsupported database engines ---
 # BACKUP STAGE only works with InnoDB. Warn if other engines are found.
 # This includes MyISAM, Memory, CSV, Archive, etc.
 log_info "Checking for unsupported database engines..."
@@ -359,7 +448,7 @@ function validate_pid() {
     # Check cmdline matches (protect against PID reuse)
     if [[ -n "${expected_cmdline_pattern}" ]]; then
         local current_cmdline
-        current_cmdline="$(cat /proc/"${pid}"/cmdline 2>/dev/null | tr '\0' ' ' || true)"
+        current_cmdline="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null || true)"
         if [[ ! "${current_cmdline}" =~ ${expected_cmdline_pattern} ]]; then
             log_warn "PID ${pid} cmdline mismatch. Expected pattern: ${expected_cmdline_pattern}, got: ${current_cmdline}"
             return 1
@@ -407,14 +496,14 @@ function get_pid_from_file() {
     echo "${pid_info}" | cut -d: -f1
 }
 
-# helper function: stop and kill a process by pid file with PID reuse protection
+# helper function: stop and kill a process by PID file with PID reuse protection
 function stop_and_kill_by_pid_file() {
     local pid_file="$1"
     local label="${2:-process}"
     local expected_cmdline_pattern="${3:-}"  # optional cmdline pattern for validation
 
     if [[ ! -f "${pid_file}" ]]; then
-        log_debug "Pid file not found (${pid_file}). Cannot stop or kill ${label}."
+        log_debug "PID file not found (${pid_file}). Cannot stop or kill ${label}."
         return 0
     fi
 
@@ -456,10 +545,10 @@ function cleanup_on_abort_or_error() {
     exec 3>&- 2>/dev/null || true
     exec 4<&- 2>/dev/null || true
 
-    # Close FIFO_HOLDER background process; that should stop mariadb also.
+    # Close FIFO_HOLDER background process; that should stop the MariaDB client also.
     stop_and_kill_by_pid_file "${FIFO_HOLDER_PID_FILE}" "fifo_holder" "bash"
 
-    # Failsafe stop of mariadb; that should release the locks.
+    # Failsafe stop of MariaDB client; that should release the locks.
     stop_and_kill_by_pid_file "${MARIADB_PID_FILE}" "mariadb_client" "timeout.*mariadb"
 
     rm -rf "${RUN_DIR}" || true
@@ -497,14 +586,14 @@ log_debug "Created FIFO_IN: ${FIFO_IN}"
 log_debug "Created FIFO_OUT: ${FIFO_OUT}"
 
 
-# --- Start mariadb as background process ---
+# --- Start mariadb client as background process ---
 # nohup ::= keep running if this script exits; output goes to FIFO/redirects below.
 # stdbuf -oL ::= line-buffered output; required for FIFO line-by-line processing.
 # timeout ::= hard limit to avoid an orphaned client after pre-freeze.
 # --skip-reconnect ::= reconnects will lose session and locks.
-# Note: We store the PID of the timeout wrapper. Signals will be forwarded to mariadb.
+# Note: We store the PID of the timeout wrapper. Signals will be forwarded to mariadb client.
 # When killing this PID, timeout will propagate the signal to the mariadb client.
-log_info "Starting persistent mariadb session with FIFO_IN ${FIFO_IN} and FIFO_OUT ${FIFO_OUT}..."
+log_info "Starting persistent MariaDB client session with FIFO_IN ${FIFO_IN} and FIFO_OUT ${FIFO_OUT}..."
 nohup stdbuf -oL \
     timeout --preserve-status --signal=KILL "${FREEZE_AND_THAW_TIMEOUT_SEC}" \
     mariadb --defaults-file="${DEFAULTS_FILE}" --skip-reconnect --skip-column-names --silent \
@@ -514,16 +603,16 @@ readonly MARIADB_PID=$!
 save_pid_with_metadata "${MARIADB_PID}" "${MARIADB_PID_FILE}"
 sleep 1    # Failsafe: some time for the mariadb process to start and connect to the FIFOs.
 if [[ -z "${MARIADB_PID}" ]] || ! kill -0 "${MARIADB_PID}" 2>/dev/null; then
-    log_error "Failed to start mariadb session (no valid pid)."
+    log_error "Failed to start MariaDB client session (no valid PID)."
     exit 1
 fi
-log_info "Started persistent mariadb session with pid ${MARIADB_PID} (timeout wrapper)."
+log_info "Started persistent MariaDB client session with PID ${MARIADB_PID} (timeout wrapper)."
 
 
 # --- Create background process to keep the FIFO open ---
 # This process survives after pre-freeze; post-thaw relies on the FIFOs staying open.
 # The lock file removal by post-thaw is the normal stop signal.
-# No logging to stdout or stderr in background jobs. This can break automations.
+# No logging to stdout or stderr in background jobs. This can break automation.
 (
     exec 3> "${FIFO_IN}"
     exec 4< "${FIFO_OUT}"
@@ -537,7 +626,7 @@ log_info "Started persistent mariadb session with pid ${MARIADB_PID} (timeout wr
         declare -i current_ts
         current_ts=$(date +%s)
         if (( current_ts - start_ts >= FREEZE_AND_THAW_TIMEOUT_SEC )); then
-            log_system_cat_only 3 "[ERROR] Timeout after ${FREEZE_AND_THAW_TIMEOUT_SEC}s waiting for lock file ${LOCK_FILE}."
+            log_system_cat_only 3 "[ERROR] Timeout after ${FREEZE_AND_THAW_TIMEOUT_SEC}s waiting for the post-thaw script to release the lock file ${LOCK_FILE}."
             exit 124
         fi
         sleep 1
@@ -561,21 +650,21 @@ function send_sql() {
     local sql="$1"
 
     if ! kill -0 "${MARIADB_PID}" 2>/dev/null; then
-        log_error "mariadb client is not running anymore (${MARIADB_PID})."
+        log_error "MariaDB client is not running anymore (${MARIADB_PID})."
         return 1
     fi
 
     # Validate PID hasn't been reused before sending SQL
     if ! validate_pid "${MARIADB_PID_FILE}" "timeout.*mariadb"; then
-        log_error "mariadb client PID validation failed (likely PID reuse)."
+        log_error "MariaDB client PID validation failed (likely PID reuse)."
         return 1
     fi
 
-    # send SQL + Marker via FD 3
+    # Send SQL and marker via FD 3
     log_debug "mariadb> ${sql}\\nSELECT \"${SQL_MARKER}\" AS marker;\\n"
     printf '%s\nSELECT "%s" AS marker;\n' "${sql}" "${SQL_MARKER}" >&3
 
-    # read response until marker appears (or timeout)
+    # Read response until marker appears (or timeout)
     local line
     local response=""
     local found_marker=0
@@ -624,7 +713,7 @@ function send_sql() {
     fi
 }
 
-log_info "Starting mariadb backup stages..."
+log_info "Starting MariaDB backup stages..."
 
 # Validate STATE_FILE is writable before proceeding
 if ! touch "${STATE_FILE}" 2>/dev/null; then
@@ -653,6 +742,6 @@ exec 4<&-
 log_info "BACKUP STAGE BLOCK_COMMIT sent - database should now be in consistent state."
 
 sync
-log_info "Filesystem write caches synchronized. Filesystem should now be in consistent state also."
+log_info "Called 'sync'. File system write caches have been synchronized. The file system should now also be in a consistent state."
 
 exit 0
