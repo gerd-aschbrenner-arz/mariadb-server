@@ -479,10 +479,38 @@ function save_pid_with_metadata() {
     fi
 
     local cmdline start_time
-    cmdline="$(cat /proc/"${pid}"/cmdline 2>/dev/null | tr '\0' ' ' || echo "unknown")"
+    cmdline="$(tr '\0' ' ' < /proc/"${pid}"/cmdline 2>/dev/null || echo "unknown")"
     start_time="$(awk '{print $22}' /proc/"${pid}"/stat 2>/dev/null || echo "0")"
 
     printf '%s:%s:%s\n' "${pid}" "${cmdline}" "${start_time}" > "${pid_file}"
+}
+
+# helper function: atomically create PID file with metadata
+# Uses ln(2) semantics: only one process can link to the final path.
+function create_pid_file_atomically() {
+    local pid="$1"
+    local pid_file="$2"
+
+    if [[ -z "${pid}" ]] || ! kill -0 "${pid}" 2>/dev/null; then
+        log_error "Cannot save invalid PID atomically: ${pid}"
+        return 1
+    fi
+
+    local cmdline start_time
+    cmdline="$(tr '\0' ' ' < /proc/"${pid}"/cmdline 2>/dev/null || echo "unknown")"
+    start_time="$(awk '{print $22}' /proc/"${pid}"/stat 2>/dev/null || echo "0")"
+
+    local tmp_pid_file
+    tmp_pid_file="${pid_file}.$$.${pid}.${RANDOM}.tmp"
+    printf '%s:%s:%s\n' "${pid}" "${cmdline}" "${start_time}" > "${tmp_pid_file}"
+
+    if ln "${tmp_pid_file}" "${pid_file}" 2>/dev/null; then
+        rm -f "${tmp_pid_file}"
+        return 0
+    fi
+
+    rm -f "${tmp_pid_file}"
+    return 1
 }
 
 # helper function: extract PID from PID file (first field)
@@ -558,22 +586,34 @@ trap cleanup_on_abort_or_error ERR INT TERM
 
 
 # --- Prepare runtime dir and lock file ---
-if [[ -f "${LOCK_FILE}" ]]; then
-    # Check if another pre-freeze instance is running using PID validation
+mkdir -p "${RUN_DIR}"
+chmod 700 "${RUN_DIR}"
+
+# Acquire pre-freeze lock atomically to prevent concurrent runs.
+if ! create_pid_file_atomically "$$" "${LOCK_FILE}"; then
+    # Check if another pre-freeze instance is running using PID validation.
     if validate_pid "${LOCK_FILE}" "mariadb-pre-freeze"; then
         old_pid="$(get_pid_from_file "${LOCK_FILE}" || true)"
         log_error "Aborting because another backup process is running (${old_pid})"
         exit 1
     fi
+
     log_warn "Stale lock found, cleaning runtime dir"
     stop_and_kill_by_pid_file "${FIFO_HOLDER_PID_FILE}" "fifo_holder" "bash"
     stop_and_kill_by_pid_file "${MARIADB_PID_FILE}" "mariadb_client" "timeout.*mariadb"
     rm -rf "${RUN_DIR:?}/"*
+
+    if ! create_pid_file_atomically "$$" "${LOCK_FILE}"; then
+        if validate_pid "${LOCK_FILE}" "mariadb-pre-freeze"; then
+            old_pid="$(get_pid_from_file "${LOCK_FILE}" || true)"
+            log_error "Aborting because another backup process is running (${old_pid})"
+        else
+            log_error "Failed to acquire lock file atomically: ${LOCK_FILE}"
+        fi
+        exit 1
+    fi
 fi
-mkdir -p "${RUN_DIR}"
-chmod 700 "${RUN_DIR}"
-save_pid_with_metadata "$$" "${LOCK_FILE}"
-log_debug "Created lock file with PID metadata: ${LOCK_FILE}"
+log_debug "Acquired lock file atomically with PID metadata: ${LOCK_FILE}"
 
 # --- Create FIFOs for remote control of the mariadb background job ---
 rm -f "${FIFO_IN}" "${FIFO_OUT}"
